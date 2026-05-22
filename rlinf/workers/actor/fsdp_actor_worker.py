@@ -1417,6 +1417,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     elif SupportedModel(self.cfg.actor.model.model_type) in [
                         SupportedModel.GR00T,
                         SupportedModel.GR00T_1_6,
+                        SupportedModel.GR00T_1_7,
                     ]:
                         kwargs["prev_logprobs"] = prev_logprobs
 
@@ -1437,6 +1438,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     if SupportedModel(self.cfg.actor.model.model_type) in [
                         SupportedModel.GR00T,
                         SupportedModel.GR00T_1_6,
+                        SupportedModel.GR00T_1_7,
                     ]:
                         prev_logprobs = output_dict["prev_logprobs"]
 

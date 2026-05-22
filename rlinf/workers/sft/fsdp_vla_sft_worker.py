@@ -65,6 +65,14 @@ class FSDPVlaSftWorker(FSDPSftWorker):
 
             return build_gr00t_dataloader(self, eval_dataset)
         elif SupportedModel(self.cfg.actor.model.model_type) in [
+            SupportedModel.GR00T_1_7_SFT
+        ]:
+            from rlinf.models.embodiment.gr00t_1_7.gr00t_17_sft_model import (
+                build_gr00t_dataloader,
+            )
+
+            return build_gr00t_dataloader(self, eval_dataset)
+        elif SupportedModel(self.cfg.actor.model.model_type) in [
             SupportedModel.DREAMZERO
         ]:
             self._dreamzero_loss = None
