@@ -582,7 +582,7 @@ class GR00T_N1_7_ForRLActionPrediction(Gr00tN1d7, BasePolicy):
 
         # self._modality_config = modality_config
         # self._modality_transform = modality_transform
-        if modality_config is None or modality_transform is None:
+        if modality_transform is None:
             from transformers import AutoProcessor
 
             print("loading Processor...")
@@ -595,13 +595,48 @@ class GR00T_N1_7_ForRLActionPrediction(Gr00tN1d7, BasePolicy):
                 with open(processor_path / "embodiment_id.json", "r") as f:
                     processor_cfg["embodiment_id_mapping"] = json.load(f)
                 modality_transform = Gr00tN1d7Processor(**processor_cfg)
-                modality_config = getattr(modality_transform, "modality_configs", None)
+                if modality_config is None:
+                    modality_config = getattr(
+                        modality_transform, "modality_configs", None
+                    )
             else:
-                processor = AutoProcessor.from_pretrained(
-                    str(local_model_path), trust_remote_code=True
-                )
-                modality_transform = processor
-                modality_config = getattr(processor, "modality_config", None)
+                try:
+                    processor = AutoProcessor.from_pretrained(
+                        str(local_model_path), trust_remote_code=True
+                    )
+                    modality_transform = processor
+                    if modality_config is None:
+                        modality_config = getattr(processor, "modality_config", None)
+                except Exception as e:
+                    # N1.7 finetuned ckpts often don't register Gr00tN1d7Processor
+                    # with AutoProcessor — fall back to loading from raw files in
+                    # the ckpt dir if they exist.
+                    print(
+                        f"AutoProcessor.from_pretrained failed ({type(e).__name__}: {e}); "
+                        "trying raw processor_config.json from ckpt dir."
+                    )
+                    ckpt_dir = Path(local_model_path)
+                    pcfg_path = ckpt_dir / "processor_config.json"
+                    stats_path = ckpt_dir / "statistics.json"
+                    embid_path = ckpt_dir / "embodiment_id.json"
+                    if all(p.exists() for p in [pcfg_path, stats_path, embid_path]):
+                        with open(pcfg_path) as f:
+                            pcfg = json.load(f)["processor_kwargs"]
+                        with open(stats_path) as f:
+                            pcfg["statistics"] = json.load(f)
+                        with open(embid_path) as f:
+                            pcfg["embodiment_id_mapping"] = json.load(f)
+                        modality_transform = Gr00tN1d7Processor(**pcfg)
+                        if modality_config is None:
+                            modality_config = getattr(
+                                modality_transform, "modality_configs", None
+                            )
+                    else:
+                        print(
+                            "Warning: could not construct modality_transform "
+                            "from ckpt; obs preprocessing will skip."
+                        )
+                        modality_transform = None
 
             print("Processor loaded safely. No model weights were touched.")
 
@@ -1285,6 +1320,49 @@ class GR00T_N1_7_ForRLActionPrediction(Gr00tN1d7, BasePolicy):
     ) -> dict[str, Any]:
         return self.unapply_transforms({"action": normalized_action.cpu()})
 
+    def _action_dim_from_statistics(self, tag_value: str, modality_keys):
+        """Sum per-key action dimensionalities from ckpt's statistics.json.
+
+        statistics.json layout (N1.7 SFT trainer writes one of these):
+            {
+                "<embodiment_tag>": {
+                    "action": {
+                        "<key>": {"min": [...], "max": [...], ...}
+                    }
+                }
+            }
+
+        The length of ``min`` (or any stat vector) is the per-key action dim.
+        For G1+Dex3 (left_arm/right_arm/left_hand/right_hand) this gives
+        7+7+7+7 = 28.
+
+        Returns 0 if statistics.json is missing or doesn't have the required
+        per-key entries.
+        """
+        stats_path = self.model_path / "statistics.json"
+        if not stats_path.exists():
+            return 0
+        try:
+            with open(stats_path, "r") as f:
+                stats = json.load(f)
+        except Exception:
+            return 0
+        tag_stats = stats.get(tag_value)
+        if not isinstance(tag_stats, dict) or "action" not in tag_stats:
+            return 0
+        action_stats = tag_stats["action"]
+        total = 0
+        for key in modality_keys:
+            key_stats = action_stats.get(key)
+            if not isinstance(key_stats, dict):
+                continue
+            for stat_name in ("min", "max", "mean", "q01", "q99"):
+                vec = key_stats.get(stat_name)
+                if isinstance(vec, list):
+                    total += len(vec)
+                    break
+        return total
+
     def _load_metadata(self, exp_cfg_dir: Path):
         metadata_path = exp_cfg_dir / "metadata.json"
         if not metadata_path.exists():
@@ -1326,7 +1404,25 @@ class GR00T_N1_7_ForRLActionPrediction(Gr00tN1d7, BasePolicy):
                     hasattr(action_modality_cfg, "modality_keys")
                     and action_modality_cfg.modality_keys
                 ):
-                    valid_action_dim = getattr(self.config, "max_action_dim", 29)
+                    # N1.7 SFT-saved modality_configs only carry modality_keys +
+                    # delta_indices; dim_map isn't populated. Derive per-key
+                    # dimensionality from ckpt/statistics.json (the only place
+                    # the true vector lengths are stored alongside min/max/q01).
+                    valid_action_dim = self._action_dim_from_statistics(
+                        tag_value, action_modality_cfg.modality_keys
+                    )
+                    if valid_action_dim == 0:
+                        # statistics.json missing for these keys — bail to the
+                        # head-output width and warn loudly.
+                        valid_action_dim = getattr(
+                            self.config, "max_action_dim", 29
+                        )
+                        print(
+                            f"WARNING: could not derive action_dim from "
+                            f"statistics.json for tag={tag_value} "
+                            f"keys={action_modality_cfg.modality_keys}; "
+                            f"falling back to max_action_dim={valid_action_dim}."
+                        )
                 elif isinstance(action_modality_cfg, dict):
                     if action_modality_cfg.get("dim_map"):
                         for dim_val in action_modality_cfg["dim_map"].values():

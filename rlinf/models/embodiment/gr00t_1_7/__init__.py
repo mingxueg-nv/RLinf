@@ -50,6 +50,38 @@ if _OLD_ASSET_PATHS is None:
     sys.modules["rlinf.envs.libero.asset_paths"] = _stub
 
 
+def _load_ckpt_modality_config(ckpt_dir: Path):
+    """Load the modality_configs dict that the ckpt was *actually* trained with.
+
+    The Hugging Face ``AutoProcessor.from_pretrained`` route is unreliable for
+    N1.7 finetuned ckpts: ``Gr00tN1d7Processor`` isn't registered with
+    ``AutoProcessor`` (raises ``Unrecognized processing class``), so the
+    fallback in ``GR00T_N1_7_ForRLActionPrediction.__init__`` silently sets
+    ``self._modality_config = None`` and ``_load_metadata`` then falls back to
+    ``valid_action_dim = max_action_dim = 132`` and ``image_nums = 1`` — both
+    wrong for any real custom embodiment (e.g. our 28-dim G1+Dex3 setup with 3
+    cameras).
+
+    The SFT training script saves the true modality_configs dict (keyed by
+    embodiment tag string) under ``ckpt/experiment_cfg/config.yaml`` as a
+    YAML-pickled ``gr00t.configs.base_config.Config`` object. Load it with
+    ``yaml.UnsafeLoader`` so we get back the real ``ModalityConfig`` objects
+    (with ``.modality_keys`` / ``.delta_indices`` / ``.action_configs``
+    attributes) that ``_load_metadata`` knows how to introspect.
+
+    Returns the per-embodiment modality_configs dict, or ``None`` if the file
+    isn't present (older ckpt layout — caller falls back to the old behaviour).
+    """
+    import yaml
+
+    cfg_path = ckpt_dir / "experiment_cfg" / "config.yaml"
+    if not cfg_path.exists():
+        return None
+    with open(cfg_path) as f:
+        exp_cfg = yaml.load(f, Loader=yaml.UnsafeLoader)
+    return getattr(getattr(exp_cfg, "data", None), "modality_configs", None)
+
+
 def _resolve_embodiment_tag(embodiment_tag_str: str):
     """Map RLinf yaml ``embodiment_tag`` strings to N1.7 ``EmbodimentTag``.
 
@@ -181,6 +213,22 @@ def get_model(cfg: DictConfig, torch_dtype=torch.bfloat16):
     obs_converter_type = OmegaConf.select(cfg, "obs_converter_type", default=None)
     processor_path = OmegaConf.select(cfg, "processor_path", default=None)
 
+    # Load the real modality_configs the ckpt was trained with (see helper
+    # docstring for why AutoProcessor's path is unreliable for SFT ckpts).
+    modality_config = _load_ckpt_modality_config(model_path)
+    if modality_config is not None:
+        tags_in_cfg = list(modality_config.keys())
+        print(
+            f"[gr00t_1_7] Loaded ckpt modality_configs for tags={tags_in_cfg} "
+            f"from {model_path / 'experiment_cfg' / 'config.yaml'}"
+        )
+    else:
+        print(
+            "[gr00t_1_7] WARNING: no experiment_cfg/config.yaml in ckpt; "
+            "will fall back to inferring valid_action_dim from config.json "
+            "(this is almost certainly wrong for custom embodiments)."
+        )
+
     model = model_cls.from_pretrained(
         pretrained_model_name_or_path=str(model_path),
         local_model_path=str(model_path),
@@ -191,6 +239,7 @@ def get_model(cfg: DictConfig, torch_dtype=torch.bfloat16):
         obs_converter_type=obs_converter_type,
         rl_head_config=cfg.rl_head_config,
         processor_path=processor_path,
+        modality_config=modality_config,
         # Pass-through kwargs that PreTrainedModel.from_pretrained
         # forwards into Gr00tN1d7Config / Gr00tN1d7.__init__.
         trust_remote_code=True,
