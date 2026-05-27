@@ -128,6 +128,10 @@ class FlowMatchingActionHeadForRLActionPrediction(nn.Module):
     def prepare_input(self, inputs: dict) -> BatchFeature:
         from transformers.feature_extraction_utils import BatchFeature
 
+        # This is the *action head*'s prepare_input. It is called from the
+        # parent Gr00tN1d7.prepare_input (gr00t.model.gr00t_n1d7.gr00t_n1d7),
+        # which already routes vision/text inputs to backbone.prepare_input
+        # separately, and packs only the action-head-relevant keys here.
         action_inputs = {}
         for k in ["state", "action", "action_mask", "embodiment_id"]:
             if k in inputs:
@@ -724,30 +728,44 @@ class GR00T_N1_7_ForRLActionPrediction(Gr00tN1d7, BasePolicy):
                 state_tensor.shape[:-1], dtype=torch.bool, device=state_tensor.device
             )
         bsize = state_tensor.shape[0]
-        self.image_nums = forward_inputs["eagle_pixel_values"].shape[1]
+
+        # N1.7 uses a Qwen3-VL backbone whose processor returns *flat* patch
+        # tensors (`pixel_values: [sum(t*h*w), patch_dim]`) paired with
+        # `image_grid_thw: [num_images_total, 3]`. The N1.5/N1.6 Eagle-style
+        # dense reshape into `[bsize, image_nums, 3, H, W]` is wrong for this
+        # layout and would crash here. Pull the VLM inputs through unchanged.
         normalized_input = {
             "state": forward_inputs["state"],
-            # "state_mask": forward_inputs["state_mask"],
             "state_mask": forward_inputs.get("state_mask", None),
-            "eagle_input_ids": forward_inputs["eagle_input_ids"],
-            "eagle_attention_mask": forward_inputs["eagle_attention_mask"],
-            "eagle_pixel_values": forward_inputs["eagle_pixel_values"].reshape(
-                bsize, self.image_nums, *forward_inputs["eagle_pixel_values"].shape[-3:]
-            ),
-            "eagle_image_sizes": forward_inputs["eagle_image_sizes"].reshape(
-                bsize, self.image_nums, *forward_inputs["eagle_image_sizes"].shape[-1:]
-            ),
             "embodiment_id": forward_inputs["embodiment_id"],
         }
+        for k in [
+            "input_ids",
+            "attention_mask",
+            "pixel_values",
+            "image_grid_thw",
+            "eagle_input_ids",
+            "eagle_attention_mask",
+            "eagle_pixel_values",
+            "eagle_image_sizes",
+        ]:
+            if k in forward_inputs:
+                normalized_input[k] = forward_inputs[k]
 
-        if "eagle_input_ids" in normalized_input:
+        # Backward-compat aliases: some upstream code still uses the eagle_*
+        # names. Mirror them into the bare names that Qwen3Backbone consumes.
+        if "eagle_input_ids" in normalized_input and "input_ids" not in normalized_input:
             normalized_input["input_ids"] = normalized_input["eagle_input_ids"]
-            normalized_input["attention_mask"] = normalized_input[
-                "eagle_attention_mask"
-            ]
+        if (
+            "eagle_attention_mask" in normalized_input
+            and "attention_mask" not in normalized_input
+        ):
+            normalized_input["attention_mask"] = normalized_input["eagle_attention_mask"]
+        if (
+            "eagle_pixel_values" in normalized_input
+            and "pixel_values" not in normalized_input
+        ):
             normalized_input["pixel_values"] = normalized_input["eagle_pixel_values"]
-            if "eagle_image_sizes" in normalized_input:
-                normalized_input["image_sizes"] = normalized_input["eagle_image_sizes"]
 
         normalized_input = {k: v for k, v in normalized_input.items() if v is not None}
 
@@ -930,7 +948,43 @@ class GR00T_N1_7_ForRLActionPrediction(Gr00tN1d7, BasePolicy):
             ]
 
         normalized_action, result = self._get_rl_action(normalized_input, mode=mode)
-        unnormalized_action = self._get_unnormalized_action(normalized_action)
+
+        # Build the raw-state dict that unapply_transforms needs to convert
+        # RELATIVE action heads (left_arm / right_arm) back to absolute joint
+        # targets. Use modality_config.state.modality_keys as the source of
+        # truth for the key set (these are the bare names this ckpt's
+        # state_action_processor expects, e.g. left_arm/right_arm/left_hand/
+        # right_hand). Fall back to whatever state-like keys are present.
+        raw_state_dict: dict[str, np.ndarray] = {}
+        try:
+            tag_val = (
+                self.embodiment_tag.value
+                if hasattr(self.embodiment_tag, "value")
+                else str(self.embodiment_tag)
+            )
+            state_modality_keys = []
+            if (
+                self._modality_config is not None
+                and tag_val in self._modality_config
+                and "state" in self._modality_config[tag_val]
+            ):
+                state_cfg = self._modality_config[tag_val]["state"]
+                if hasattr(state_cfg, "modality_keys") and state_cfg.modality_keys:
+                    state_modality_keys = list(state_cfg.modality_keys)
+                elif (
+                    isinstance(state_cfg, dict)
+                    and state_cfg.get("modality_keys") is not None
+                ):
+                    state_modality_keys = list(state_cfg["modality_keys"])
+            for k in state_modality_keys:
+                if k in obs_copy:
+                    raw_state_dict[k] = obs_copy[k]
+        except Exception:
+            raw_state_dict = {}
+
+        unnormalized_action = self._get_unnormalized_action(
+            normalized_action, state=raw_state_dict or None
+        )
 
         if not is_batch:
             unnormalized_action = squeeze_dict_values(unnormalized_action)
@@ -983,12 +1037,13 @@ class GR00T_N1_7_ForRLActionPrediction(Gr00tN1d7, BasePolicy):
         from PIL import Image
 
         class SimulationContent:
-            def __init__(self, embodiment, states, actions, images, text):
+            def __init__(self, embodiment, states, actions, images, text, masks=None):
                 self.embodiment = embodiment
                 self.states = states
                 self.actions = actions
                 self.images = images
                 self.text = text
+                self.masks = masks
 
         batch_size = len(next(iter(obs.values())))
 
@@ -997,9 +1052,17 @@ class GR00T_N1_7_ForRLActionPrediction(Gr00tN1d7, BasePolicy):
         state_keys = []
         for k in obs.keys():
             k_lower = k.lower()
-            if "task" in k_lower or "lang" in k_lower or "instruction" in k_lower:
+            # Prefer GR00T's canonical modality prefixes (video./state./annotation.)
+            # so configs that map cameras to e.g. "video.room_view" still classify
+            # correctly. Fall back to the legacy substring heuristic for keys that
+            # do not follow the prefix convention (libero / maniskill style).
+            if k.startswith("annotation.") or (
+                "task" in k_lower or "lang" in k_lower or "instruction" in k_lower
+            ):
                 text_key = k
-            elif "image" in k_lower or "rgb" in k_lower or "cam" in k_lower:
+            elif k.startswith("video.") or (
+                "image" in k_lower or "rgb" in k_lower or "cam" in k_lower
+            ):
                 image_keys.append(k)
             else:
                 state_keys.append(k)
@@ -1184,14 +1247,26 @@ class GR00T_N1_7_ForRLActionPrediction(Gr00tN1d7, BasePolicy):
 
     # def unapply_transforms(self, action: dict[str, Any]) -> dict[str, Any]:
     #     return self._modality_transform.unapply(action)
-    def unapply_transforms(self, action: dict[str, Any]) -> dict[str, Any]:
+    def unapply_transforms(
+        self,
+        action: dict[str, Any],
+        state: dict[str, np.ndarray] | None = None,
+    ) -> dict[str, Any]:
         raw_action_tensor = action["action"]
 
         if isinstance(raw_action_tensor, torch.Tensor):
             raw_action_tensor = raw_action_tensor.detach().cpu().numpy()
 
+        # N1.7 SFT ckpts trained with use_relative_action=True (left_arm /
+        # right_arm are RELATIVE in conf.yaml.action_configs) need the current
+        # raw state to convert delta-joint predictions back to absolute joint
+        # targets. Without it, Isaac-GR00T's state_action_processor.unapply_action
+        # raises "State dict required for relative->absolute conversion of key
+        # 'left_arm' ...". Pass the raw GR00T-format state dict through.
         decoded = self._modality_transform.decode_action(
-            action=raw_action_tensor, embodiment_tag=self.embodiment_tag, state=None
+            action=raw_action_tensor,
+            embodiment_tag=self.embodiment_tag,
+            state=state,
         )
         return decoded
 
@@ -1233,14 +1308,23 @@ class GR00T_N1_7_ForRLActionPrediction(Gr00tN1d7, BasePolicy):
             "denoise_inds": rlinf_outputs["denoise_inds"],
             **normalized_input,
         }
-        bsize = normalized_input["state"].shape[0]
         device = normalized_input["state"].device
 
+        # Qwen3-VL processor produces *flat* pixel_values of shape
+        # `[sum(t_i * h_i * w_i), patch_dim]` paired with `image_grid_thw`
+        # `[num_images_total, 3]`, NOT the dense `[B, N, 3, H, W]` layout used
+        # by the N1.5/N1.6 Eagle backbone. The old reshape into
+        # `[bsize, image_nums, 3, H, W]` is incompatible with this layout and
+        # used to crash with `RuntimeError: shape '[2, 3, 1536, 1536]' is
+        # invalid for input of size <...>` at eval time. Pass the Qwen3-VL
+        # tensors through unchanged; the backbone (Qwen3Backbone) expects exactly
+        # `input_ids / attention_mask / pixel_values / image_grid_thw`.
         for k in [
             "eagle_pixel_values",
             "eagle_image_sizes",
             "pixel_values",
             "image_sizes",
+            "image_grid_thw",
         ]:
             if k in normalized_input and isinstance(normalized_input[k], list):
                 if len(normalized_input[k]) > 0 and isinstance(
@@ -1251,31 +1335,8 @@ class GR00T_N1_7_ForRLActionPrediction(Gr00tN1d7, BasePolicy):
                     normalized_input[k] = torch.tensor(
                         normalized_input[k], device=device
                     )
+                forward_inputs[k] = normalized_input[k]
 
-        if "eagle_pixel_values" in normalized_input:
-            forward_inputs["eagle_pixel_values"] = normalized_input[
-                "eagle_pixel_values"
-            ].reshape(
-                bsize,
-                self.image_nums,
-                *normalized_input["eagle_pixel_values"].shape[-3:],
-            )
-        if "eagle_image_sizes" in normalized_input:
-            forward_inputs["eagle_image_sizes"] = normalized_input[
-                "eagle_image_sizes"
-            ].reshape(
-                bsize,
-                self.image_nums,
-                *normalized_input["eagle_image_sizes"].shape[-1:],
-            )
-        if "pixel_values" in normalized_input:
-            forward_inputs["pixel_values"] = normalized_input["pixel_values"].reshape(
-                bsize, self.image_nums, *normalized_input["pixel_values"].shape[-3:]
-            )
-        if "image_sizes" in normalized_input:
-            forward_inputs["image_sizes"] = normalized_input["image_sizes"].reshape(
-                bsize, self.image_nums, *normalized_input["image_sizes"].shape[-1:]
-            )
         result = {
             "prev_logprobs": rlinf_outputs["prev_logprobs"],
             "prev_values": rlinf_outputs["prev_values"],
@@ -1316,9 +1377,13 @@ class GR00T_N1_7_ForRLActionPrediction(Gr00tN1d7, BasePolicy):
         return normalized_action
 
     def _get_unnormalized_action(
-        self, normalized_action: torch.Tensor
+        self,
+        normalized_action: torch.Tensor,
+        state: dict[str, np.ndarray] | None = None,
     ) -> dict[str, Any]:
-        return self.unapply_transforms({"action": normalized_action.cpu()})
+        return self.unapply_transforms(
+            {"action": normalized_action.cpu()}, state=state
+        )
 
     def _action_dim_from_statistics(self, tag_value: str, modality_keys):
         """Sum per-key action dimensionalities from ckpt's statistics.json.

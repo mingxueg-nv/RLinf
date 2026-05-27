@@ -14,6 +14,7 @@
 
 import copy
 import gc
+import os
 from typing import Any, Literal
 
 import numpy as np
@@ -624,6 +625,27 @@ class MultiStepRolloutWorker(Worker):
             if tensor is None:
                 return tuple(None for _ in sizes)
             return tuple(torch.split(tensor, sizes, dim=0))
+
+        if os.environ.get("RLINF_DEBUG_SPLIT") == "1":
+            def _shape(t):
+                if t is None:
+                    return None
+                if isinstance(t, torch.Tensor):
+                    return tuple(t.shape)
+                return f"<{type(t).__name__}>"
+            print(
+                f"[DEBUG_SPLIT] sizes={sizes} sum={sum(sizes)} "
+                f"actions={_shape(rollout_result.actions)} "
+                f"prev_logprobs={_shape(rollout_result.prev_logprobs)} "
+                f"prev_values={_shape(rollout_result.prev_values)} "
+                f"bootstrap_values={_shape(rollout_result.bootstrap_values)} "
+                f"save_flags={_shape(rollout_result.save_flags)} "
+                f"versions={_shape(rollout_result.versions)}",
+                flush=True,
+            )
+            if rollout_result.forward_inputs:
+                for k, v in rollout_result.forward_inputs.items():
+                    print(f"[DEBUG_SPLIT] forward_inputs[{k!r}] shape={_shape(v)}", flush=True)
 
         split_actions = _split_optional_tensor(rollout_result.actions)
         split_prev_logprobs = _split_optional_tensor(rollout_result.prev_logprobs)
